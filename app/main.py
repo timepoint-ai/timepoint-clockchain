@@ -1,0 +1,91 @@
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from app.api import api_router
+from app.core.config import get_settings
+from app.core.graph import GraphManager
+from app.core.jobs import JobManager
+from app.workers.renderer import FlashClient
+
+logger = logging.getLogger("clockchain")
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    settings = get_settings()
+    logging.basicConfig(
+        level=logging.DEBUG if settings.DEBUG else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logger.info("Clockchain starting up (env=%s)", settings.ENVIRONMENT)
+
+    # Graph manager
+    gm = GraphManager(data_dir=settings.DATA_DIR)
+    await gm.load()
+    application.state.graph_manager = gm
+
+    # Job manager
+    flash_client = FlashClient(settings.FLASH_URL, settings.FLASH_SERVICE_KEY)
+    job_manager = JobManager(graph_manager=gm, flash_client=flash_client)
+    application.state.job_manager = job_manager
+
+    # Expander (gated by feature flag)
+    expander_task = None
+    if settings.EXPANSION_ENABLED and settings.GOOGLE_API_KEY:
+        try:
+            from app.workers.expander import GraphExpander
+            expander = GraphExpander(gm, settings.GOOGLE_API_KEY)
+            expander_task = asyncio.create_task(expander.start())
+            logger.info("Graph expander started")
+        except ImportError:
+            pass
+
+    # Daily worker (gated by feature flag)
+    daily_task = None
+    if settings.DAILY_CRON_ENABLED:
+        try:
+            from app.workers.daily import DailyWorker
+            daily = DailyWorker(gm, job_manager)
+            daily_task = asyncio.create_task(daily.start())
+            logger.info("Daily worker started")
+        except ImportError:
+            pass
+
+    yield
+
+    # Shutdown
+    if expander_task:
+        expander_task.cancel()
+    if daily_task:
+        daily_task.cancel()
+    await gm.save()
+    logger.info("Clockchain shutting down")
+
+
+app = FastAPI(
+    title="TIMEPOINT Clockchain",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+app.include_router(api_router)
+
+
+@app.get("/")
+async def root():
+    return {"service": "timepoint-clockchain", "version": "0.1.0"}
+
+
+@app.get("/health")
+async def health():
+    gm = getattr(app.state, "graph_manager", None)
+    nodes = gm.graph.number_of_nodes() if gm else 0
+    edges = gm.graph.number_of_edges() if gm else 0
+    return {
+        "status": "healthy",
+        "service": "timepoint-clockchain",
+        "nodes": nodes,
+        "edges": edges,
+    }
