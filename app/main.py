@@ -50,7 +50,8 @@ async def lifespan(application: FastAPI):
             from app.workers.expander import GraphExpander
 
             expander = GraphExpander(
-                gm, settings.OPENROUTER_API_KEY, model=settings.OPENROUTER_MODEL
+                gm, settings.OPENROUTER_API_KEY, model=settings.OPENROUTER_MODEL,
+                job_manager=job_manager,
             )
             expander_task = asyncio.create_task(expander.start())
             logger.info("Graph expander started")
